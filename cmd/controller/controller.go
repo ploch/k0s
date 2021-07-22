@@ -30,6 +30,7 @@ import (
 	"github.com/avast/retry-go"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	funk "github.com/thoas/go-funk"
 
 	workercmd "github.com/k0sproject/k0s/cmd/worker"
 	"github.com/k0sproject/k0s/internal/util"
@@ -70,6 +71,13 @@ func NewControllerCmd() *cobra.Command {
 			}
 			if len(c.TokenArg) > 0 && len(c.TokenFile) > 0 {
 				return fmt.Errorf("you can only pass one token argument either as a CLI argument 'k0s controller [join-token]' or as a flag 'k0s controller --token-file [path]'")
+			}
+			if len(c.DisableComponents) > 0 {
+				for _, component := range c.DisableComponents {
+					if !funk.Contains(config.AvailableComponents(), component) {
+						return fmt.Errorf("unknown component %s", component)
+					}
+				}
 			}
 			if len(c.TokenFile) > 0 {
 				bytes, err := ioutil.ReadFile(c.TokenFile)
@@ -230,7 +238,7 @@ func (c *CmdOpts) startController() error {
 			KubeClientFactory: adminClientFactory,
 		})
 	}
-	if !c.SingleNode {
+	if !c.SingleNode && !funk.Contains(c.DisableComponents, "konnectivity-server") {
 		componentManager.Add(&controller.Konnectivity{
 			ClusterConfig:     c.ClusterConfig,
 			LogLevel:          c.Logging["konnectivity-server"],
@@ -238,16 +246,20 @@ func (c *CmdOpts) startController() error {
 			KubeClientFactory: adminClientFactory,
 		})
 	}
-	componentManager.Add(&controller.Scheduler{
-		ClusterConfig: c.ClusterConfig,
-		LogLevel:      c.Logging["kube-scheduler"],
-		K0sVars:       c.K0sVars,
-	})
-	componentManager.Add(&controller.Manager{
-		ClusterConfig: c.ClusterConfig,
-		LogLevel:      c.Logging["kube-controller-manager"],
-		K0sVars:       c.K0sVars,
-	})
+	if !funk.Contains(c.DisableComponents, "kube-scheduler") {
+		componentManager.Add(&controller.Scheduler{
+			ClusterConfig: c.ClusterConfig,
+			LogLevel:      c.Logging["kube-scheduler"],
+			K0sVars:       c.K0sVars,
+		})
+	}
+	if !funk.Contains(c.DisableComponents, "kube-controller-manager") {
+		componentManager.Add(&controller.Manager{
+			ClusterConfig: c.ClusterConfig,
+			LogLevel:      c.Logging["kube-controller-manager"],
+			K0sVars:       c.K0sVars,
+		})
+	}
 
 	// One leader elector per controller
 	var leaderElector controller.LeaderElector
@@ -258,8 +270,13 @@ func (c *CmdOpts) startController() error {
 	}
 	componentManager.Add(leaderElector)
 
-	componentManager.Add(&applier.Manager{K0sVars: c.K0sVars, KubeClientFactory: adminClientFactory, LeaderElector: leaderElector})
-	if !c.SingleNode {
+	componentManager.Add(&applier.Manager{
+		K0sVars:           c.K0sVars,
+		KubeClientFactory: adminClientFactory,
+		LeaderElector:     leaderElector,
+	})
+
+	if !c.SingleNode && !funk.Contains(c.DisableComponents, "control-api") {
 		componentManager.Add(&controller.K0SControlAPI{
 			ConfigPath: c.CfgFile,
 			K0sVars:    c.K0sVars,
@@ -282,9 +299,11 @@ func (c *CmdOpts) startController() error {
 		))
 	}
 
-	componentManager.Add(controller.NewCSRApprover(c.ClusterConfig,
-		leaderElector,
-		adminClientFactory))
+	if !funk.Contains(c.DisableComponents, "csr-approver") {
+		componentManager.Add(controller.NewCSRApprover(c.ClusterConfig,
+			leaderElector,
+			adminClientFactory))
+	}
 
 	if c.EnableK0sCloudProvider {
 		componentManager.Add(
@@ -404,72 +423,89 @@ func (c *CmdOpts) startController() error {
 }
 
 func (c *CmdOpts) createClusterReconcilers(cf kubernetes.ClientFactory, leaderElector controller.LeaderElector) (map[string]component.Component, error) {
+	var err error
 	reconcilers := make(map[string]component.Component)
 	clusterSpec := c.ClusterConfig.Spec
 
-	defaultPSP, err := controller.NewDefaultPSP(clusterSpec, c.K0sVars)
-	if err != nil {
-		logrus.Warnf("failed to initialize default PSP reconciler: %s", err.Error())
-	} else {
-		reconcilers["default-psp"] = defaultPSP
+	if !funk.Contains(c.DisableComponents, "default-psp") {
+		defaultPSP, err := controller.NewDefaultPSP(clusterSpec, c.K0sVars)
+		if err != nil {
+			logrus.Warnf("failed to initialize default PSP reconciler: %s", err.Error())
+		} else {
+			reconcilers["default-psp"] = defaultPSP
+		}
 	}
 
-	proxy, err := controller.NewKubeProxy(c.ClusterConfig, c.K0sVars)
-	if err != nil {
-		logrus.Warnf("failed to initialize kube-proxy reconciler: %s", err.Error())
-	} else {
-		reconcilers["kube-proxy"] = proxy
+	if !funk.Contains(c.DisableComponents, "kube-proxy") {
+		proxy, err := controller.NewKubeProxy(c.ClusterConfig, c.K0sVars)
+		if err != nil {
+			logrus.Warnf("failed to initialize kube-proxy reconciler: %s", err.Error())
+		} else {
+			reconcilers["kube-proxy"] = proxy
+		}
 	}
 
-	coreDNS, err := controller.NewCoreDNS(c.ClusterConfig, c.K0sVars, cf)
-	if err != nil {
-		logrus.Warnf("failed to initialize CoreDNS reconciler: %s", err.Error())
-	} else {
-		reconcilers["coredns"] = coreDNS
+	if !funk.Contains(c.DisableComponents, "coredns") {
+		coreDNS, err := controller.NewCoreDNS(c.ClusterConfig, c.K0sVars, cf)
+		if err != nil {
+			logrus.Warnf("failed to initialize CoreDNS reconciler: %s", err.Error())
+		} else {
+			reconcilers["coredns"] = coreDNS
+		}
 	}
 
-	logrus.Infof("initializing network reconciler for provider %s", c.ClusterConfig.Spec.Network.Provider)
-	switch c.ClusterConfig.Spec.Network.Provider {
-	case "custom":
-		logrus.Warnf("network provider set to custom, k0s will not manage it")
-	case "calico":
-		err = c.initCalico(reconcilers)
-	case "kuberouter":
-		err = c.initKubeRouter(reconcilers)
-	}
-	if err != nil {
-		logrus.Warnf("failed to initialize network reconciler: %s", err.Error())
-		return reconcilers, err
+	if !funk.Contains(c.DisableComponents, "network-provider") {
+		logrus.Infof("initializing network reconciler for provider %s", c.ClusterConfig.Spec.Network.Provider)
+		switch c.ClusterConfig.Spec.Network.Provider {
+		case "custom":
+			logrus.Warnf("network provider set to custom, k0s will not manage it")
+		case "calico":
+			err = c.initCalico(reconcilers)
+		case "kuberouter":
+			err = c.initKubeRouter(reconcilers)
+		}
+		if err != nil {
+			logrus.Warnf("failed to initialize network reconciler: %s", err.Error())
+			return reconcilers, err
+		}
 	}
 
-	manifestsSaver, err := controller.NewManifestsSaver("helm", c.K0sVars.DataDir)
-	if err != nil {
-		logrus.Warnf("failed to initialize reconcilers manifests saver: %s", err.Error())
-		return reconcilers, err
+	if !funk.Contains(c.DisableComponents, "helm") {
+		manifestsSaver, err := controller.NewManifestsSaver("helm", c.K0sVars.DataDir)
+		if err != nil {
+			logrus.Warnf("failed to initialize reconcilers manifests saver: %s", err.Error())
+			return reconcilers, err
+		}
+		reconcilers["helmCrd"] = controller.NewCRD(manifestsSaver)
+		reconcilers["helmAddons"] = controller.NewHelmAddons(c.ClusterConfig, manifestsSaver, c.K0sVars, cf, leaderElector)
 	}
-	reconcilers["crd"] = controller.NewCRD(manifestsSaver)
-	reconcilers["helmAddons"] = controller.NewHelmAddons(c.ClusterConfig, manifestsSaver, c.K0sVars, cf, leaderElector)
 
-	metricServer, err := controller.NewMetricServer(c.ClusterConfig, c.K0sVars, cf)
-	if err != nil {
-		logrus.Warnf("failed to initialize metric controller reconciler: %s", err.Error())
-		return reconcilers, err
+	if !funk.Contains(c.DisableComponents, "metrics-server") {
+		metricServer, err := controller.NewMetricServer(c.ClusterConfig, c.K0sVars, cf)
+		if err != nil {
+			logrus.Warnf("failed to initialize metrics-server reconciler: %s", err.Error())
+			return reconcilers, err
+		}
+		reconcilers["metricServer"] = metricServer
 	}
-	reconcilers["metricServer"] = metricServer
 
-	kubeletConfig, err := controller.NewKubeletConfig(clusterSpec, c.K0sVars)
-	if err != nil {
-		logrus.Warnf("failed to initialize kubelet config reconciler: %s", err.Error())
-		return reconcilers, err
+	if !funk.Contains(c.DisableComponents, "kubelet-config") {
+		kubeletConfig, err := controller.NewKubeletConfig(clusterSpec, c.K0sVars)
+		if err != nil {
+			logrus.Warnf("failed to initialize kubelet config reconciler: %s", err.Error())
+			return reconcilers, err
+		}
+		reconcilers["kubeletConfig"] = kubeletConfig
 	}
-	reconcilers["kubeletConfig"] = kubeletConfig
 
-	systemRBAC, err := controller.NewSystemRBAC(c.K0sVars.ManifestsDir)
-	if err != nil {
-		logrus.Warnf("failed to initialize system RBAC reconciler: %s", err.Error())
-		return reconcilers, err
+	if !funk.Contains(c.DisableComponents, "system-rbac") {
+		systemRBAC, err := controller.NewSystemRBAC(c.K0sVars.ManifestsDir)
+		if err != nil {
+			logrus.Warnf("failed to initialize system RBAC reconciler: %s", err.Error())
+			return reconcilers, err
+		}
+		reconcilers["systemRBAC"] = systemRBAC
 	}
-	reconcilers["systemRBAC"] = systemRBAC
 
 	return reconcilers, nil
 }
