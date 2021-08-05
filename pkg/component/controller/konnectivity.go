@@ -46,7 +46,7 @@ type Konnectivity struct {
 	uid           int
 
 	// used for lease lock
-	KubeClientFactory k8sutil.ClientFactory
+	KubeClientFactory k8sutil.ClientFactoryInterface
 
 	serverCount int
 
